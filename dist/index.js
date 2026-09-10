@@ -38,11 +38,24 @@ const configDecl = {
     env: "OFFICE365_CLIENT_ID",
   },
   signIn: {
-    options: ["device", "browser"],
+    options: ["device", "browser", "app"],
     label: "Sign-in method",
     description:
-      "device (default) or browser. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
+      "device (default), browser or app. app is the unattended one: ilmari signs in as the application itself with a client secret, once, with no browser and no per-workflow prompt — it needs application (not delegated) permissions consented by an administrator, and a mailbox to act as. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
     env: "OFFICE365_SIGN_IN",
+  },
+  clientSecret: {
+    label: "Client secret",
+    description:
+      "Only for the app sign-in: a client secret on the app registration (Certificates & secrets). Stored encrypted. Note it expires — Entra caps a secret at 24 months.",
+    secret: true,
+    env: "OFFICE365_CLIENT_SECRET",
+  },
+  mailbox: {
+    label: "Act as mailbox",
+    description:
+      "Only for the app sign-in: the account whose mailbox, calendar and drive the steps act on (user@corp.com), since an application has no mailbox of its own. Have an administrator restrict the app to this one mailbox with an application access policy — Mail.Send as an application otherwise reaches every mailbox in the tenant.",
+    env: "OFFICE365_MAILBOX",
   },
   authCode: {
     label: "Authorization code",
@@ -232,6 +245,28 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
     return accessToken;
   };
 
+  // the application signs in as itself: one consented registration, no browser
+  // and no per-workflow prompt, so an unattended channel can send too
+  if ((cfg.signIn ?? "").trim() === "app") {
+    const clientSecret = (cfg.clientSecret ?? "").trim();
+    if (!clientSecret) throw new Error("office365: the app sign-in needs a client secret");
+    if (!tenantId) throw new Error("office365: the app sign-in needs a directory (tenant) ID");
+    const token = await postForm(`${authBase(tenantId)}/token`, {
+      grant_type: "client_credentials",
+      client_id: clientId,
+      client_secret: clientSecret,
+      scope: "https://graph.microsoft.com/.default",
+    });
+    if (!token.access_token) {
+      throw new Error(`app sign-in failed: ${token.error_description ?? token.error}`);
+    }
+    tokenCache.set(key, {
+      token: token.access_token,
+      expiresAt: Date.now() + (token.expires_in ?? 3600) * 1000,
+    });
+    return token.access_token;
+  }
+
   const stored = (cfg.refreshToken ?? "").trim();
   if (stored) {
     const refreshed = await postForm(`${authBase(tenantId)}/token`, {
@@ -259,11 +294,21 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
   return remember(await deviceCodeSignIn(clientId, tenantId, say, wait, scope));
 }
 
+/** An application has no mailbox, calendar or drive of its own, so every /me
+ *  path has to name the account it acts as instead. */
+export function actingPath(cfg, path) {
+  if ((cfg?.signIn ?? "").trim() !== "app") return path;
+  const mailbox = (cfg.mailbox ?? "").trim();
+  if (!mailbox) throw new Error("office365: the app sign-in needs a mailbox to act as");
+  return path.replace(/^\/me\b/, `/users/${encodeURIComponent(mailbox)}`);
+}
+
 /** One Graph call as the signed-in user. Returns the parsed body, or
  *  undefined for the 202/204 answers sendMail and message posts give. */
 export async function graph(ctx, method, path, body, opts = {}) {
   const token = await graphToken(ctx, opts);
   if (!token) return undefined;
+  path = actingPath(ctx.pluginConfig(PLUGIN, opts.project), path);
   const res = await fetch(`${GRAPH}${path}`, {
     method,
     headers: {
@@ -441,10 +486,14 @@ async function findFiles(ctx, query, opts) {
  *  back as bytes Graph will not convert, so this is for text-shaped files. */
 async function readFile(ctx, itemId, opts) {
   const token = await graphToken(ctx, opts);
-  const res = await fetch(`${GRAPH}/me/drive/items/${encodeURIComponent(itemId)}/content`, {
+  const path = actingPath(
+    ctx.pluginConfig(PLUGIN, opts?.project),
+    `/me/drive/items/${encodeURIComponent(itemId)}/content`,
+  );
+  const res = await fetch(`${GRAPH}${path}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
-  if (!res.ok) throw new Error(`Graph GET /me/drive/items/${itemId}/content: ${res.status}`);
+  if (!res.ok) throw new Error(`Graph GET ${path}: ${res.status}`);
   const body = await res.text();
   return body.length > FILE_READ_LIMIT
     ? `${body.slice(0, FILE_READ_LIMIT)}\n… truncated at ${FILE_READ_LIMIT} characters`

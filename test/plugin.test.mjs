@@ -373,3 +373,28 @@ test("configured permissions replace the full scope set", async () => {
   await nodeOf("office365-email").run({ to: "a@corp.com", subject: "s", body: "b" }, ctx);
   assert.equal(new URLSearchParams(seen[0].body).get("scope"), "offline_access Mail.Send");
 });
+
+test("the app sign-in uses a client secret and acts on the configured mailbox", async () => {
+  const seen = stubFetch([
+    ["/oauth2/v2.0/token", { json: { access_token: "at-app", expires_in: 3600 } }],
+    ["/sendMail", { status: 202 }],
+  ]);
+  const ctx = ctxFor({
+    config: {
+      signIn: "app",
+      clientSecret: "sec-1",
+      mailbox: "bot@corp.com",
+      refreshToken: "", // no delegated sign-in to fall back on
+    },
+  });
+  const out = await nodeOf("office365-email").run({ to: "a@corp.com", subject: "s", body: "b" }, ctx);
+
+  assert.equal(out.ok, true);
+  const auth = new URLSearchParams(seen[0].body);
+  assert.equal(auth.get("grant_type"), "client_credentials");
+  assert.equal(auth.get("client_secret"), "sec-1");
+  assert.equal(auth.get("scope"), "https://graph.microsoft.com/.default");
+  assert.match(seen[1].url, /\/users\/bot%40corp\.com\/sendMail$/);
+  // an application token is not a sign-in to remember
+  assert.deepEqual(ctx.saved, []);
+});

@@ -124,6 +124,34 @@ Line Tools, client ID `14d82eec-204b-4c2f-b7e8-296a70dab67e` — and the
 delegated scopes are then consented per user, if the tenant allows user
 consent.
 
+#### Signing in once, for the whole install
+
+The two flows above sign in *a person*, in a browser, per install. A tenant
+that refuses user consent, or an unattended daemon that must send mail with
+nobody watching, wants the third: **Sign-in method** `app`. ilmari then signs
+in as the application itself (client credentials), with no browser and no
+prompt — one registration, consented once by an administrator.
+
+It needs, on the app registration:
+
+- a **client secret** (Certificates & secrets), pasted into **Client secret** —
+  Entra expires it after at most 24 months, and a step then fails until it is
+  replaced
+- **application** permissions (not delegated), admin-consented: `Mail.Send`,
+  `Calendars.Read`, `Files.Read.All`. Teams has no usable application
+  equivalent here, so the Teams step stays on a delegated sign-in.
+- **Act as mailbox** — an application owns no mailbox, calendar or drive, so
+  every step acts on the account named here
+
+`Mail.Send` as an application reaches *every* mailbox in the tenant. Have the
+administrator scope the app to the one mailbox with an application access
+policy (`New-ApplicationAccessPolicy`) — otherwise a bug, or anyone who can
+edit a workflow, can send as anybody.
+
+The **Permissions** field is ignored in this mode: application permissions are
+whatever the registration was consented for, and the token is asked for with
+`.default`.
+
 ## Using it
 
 Report a task's result by mail:
