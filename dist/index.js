@@ -523,7 +523,7 @@ async function postTeamsMessage(ctx, { chat, team, channel, message, html }, opt
 
 const plugin = {
   name: "office365",
-  version: "0.1.1",
+  version: "0.1.2",
   description:
     "Microsoft 365 for ilmari, as the signed-in user: send mail from your own mailbox (with attachments from the working directory), read your calendar, search and read OneDrive/SharePoint files, and post into a Teams chat or channel. Sign-in is the device-code flow — you approve it once in a browser and ilmari keeps a refresh token in its encrypted config.",
   setup:
