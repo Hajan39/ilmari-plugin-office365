@@ -49,6 +49,12 @@ const configDecl = {
       "Only for the browser sign-in: paste the code (or the whole http://localhost?code=... address) here while a step waits for it. Single-use; cleared automatically once exchanged.",
     secret: true,
   },
+  scopes: {
+    label: "Permissions",
+    description:
+      "Space-separated delegated scopes to ask for. Empty means all the plugin's surfaces. Files.Read.All, Chat.ReadWrite and ChannelMessage.Send need an administrator's consent — drop them here (leaving e.g. 'offline_access Mail.Send Calendars.Read') to sign in with user consent alone, at the cost of the file, chat and channel steps.",
+    env: "OFFICE365_SCOPES",
+  },
   tenantId: {
     label: "Directory (tenant) ID",
     description:
@@ -95,12 +101,12 @@ async function postForm(url, form) {
  * the code expires (~15 minutes): node types are allowed to block, and this
  * happens once per sign-in, not once per call.
  */
-export async function deviceCodeSignIn(clientId, tenantId, announce, sleep = wait) {
+export async function deviceCodeSignIn(clientId, tenantId, announce, sleep = wait, scope = SCOPE) {
   const base = authBase(tenantId);
   const res = await fetch(`${base}/devicecode`, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ client_id: clientId, scope: SCOPE }).toString(),
+    body: new URLSearchParams({ client_id: clientId, scope }).toString(),
   });
   const start = await res.json();
   if (!start.device_code || !start.user_code) {
@@ -142,7 +148,7 @@ export async function deviceCodeSignIn(clientId, tenantId, announce, sleep = wai
  * refuses device code (the token request comes from the daemon, not from a
  * compliant device). `readCode` is polled until it yields the pasted code.
  */
-export async function browserSignIn(clientId, tenantId, announce, readCode, sleep = wait) {
+export async function browserSignIn(clientId, tenantId, announce, readCode, sleep = wait, scope = SCOPE) {
   const base = authBase(tenantId);
   const verifier = randomBytes(32).toString("base64url");
   const challenge = createHash("sha256").update(verifier).digest("base64url");
@@ -150,7 +156,7 @@ export async function browserSignIn(clientId, tenantId, announce, readCode, slee
     client_id: clientId,
     response_type: "code",
     redirect_uri: BROWSER_REDIRECT,
-    scope: SCOPE,
+    scope,
     code_challenge: challenge,
     code_challenge_method: "S256",
     prompt: "select_account",
@@ -175,7 +181,7 @@ export async function browserSignIn(clientId, tenantId, announce, readCode, slee
       code,
       redirect_uri: BROWSER_REDIRECT,
       code_verifier: verifier,
-      scope: SCOPE,
+      scope,
     });
     if (token.access_token && token.refresh_token) {
       return {
@@ -200,6 +206,7 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
   const clientId = (cfg.clientId ?? "").trim();
   if (!clientId) throw new Error("office365: no application (client) ID configured");
   const tenantId = (cfg.tenantId ?? "").trim();
+  const scope = (cfg.scopes ?? "").trim() || SCOPE;
   const say = announce ?? (() => {});
 
   const key = `${clientId}@${project ?? ""}`;
@@ -221,7 +228,7 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
       grant_type: "refresh_token",
       client_id: clientId,
       refresh_token: stored,
-      scope: SCOPE,
+      scope,
     });
     if (refreshed.access_token && refreshed.refresh_token) {
       return remember({
@@ -235,11 +242,11 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
   if (!interactive) return null;
   if ((cfg.signIn ?? "").trim() === "browser") {
     const readCode = () => (ctx.pluginConfig(PLUGIN, project)?.authCode ?? "").trim();
-    const tokens = await browserSignIn(clientId, tenantId, say, readCode);
+    const tokens = await browserSignIn(clientId, tenantId, say, readCode, wait, scope);
     ctx.savePluginConfig?.(PLUGIN, { authCode: "" }, project); // single-use
     return remember(tokens);
   }
-  return remember(await deviceCodeSignIn(clientId, tenantId, say));
+  return remember(await deviceCodeSignIn(clientId, tenantId, say, wait, scope));
 }
 
 /** One Graph call as the signed-in user. Returns the parsed body, or
