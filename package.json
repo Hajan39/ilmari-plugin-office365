@@ -1,0 +1,16 @@
+{
+  "name": "ilmari-plugin-office365",
+  "version": "0.1.0",
+  "description": "Microsoft 365 for ilmari: send mail as yourself, read your calendar, search OneDrive/SharePoint files and post into Teams — over Microsoft Graph with a device-code sign-in",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "files": ["dist"],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "keywords": ["ilmari", "ilmari-plugin", "microsoft365", "graph", "outlook", "teams"],
+  "engines": {
+    "node": ">=22"
+  }
+}
