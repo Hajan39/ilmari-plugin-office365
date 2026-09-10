@@ -7,10 +7,7 @@
 // signed-in user* is the point — mail leaves from their own mailbox and lands
 // in their Sent Items — and a public client needs no client secret to store.
 
-import { Buffer } from "node:buffer";
 import { createHash, randomBytes } from "node:crypto";
-import { connect as netConnect } from "node:net";
-import { connect as tlsConnect } from "node:tls";
 
 const PLUGIN = "office365";
 const GRAPH = "https://graph.microsoft.com/v1.0";
@@ -32,8 +29,6 @@ const ATTACHMENT_LIMIT = 3 * 1024 * 1024;
 /** A file read into a prompt is charged as tokens — read the head of a big
  *  one rather than blowing up the context window. */
 const FILE_READ_LIMIT = 200_000;
-/** An unanswered relay must not hang a workflow step for ever. */
-const TIMEOUT_MS = 30_000;
 
 const configDecl = {
   clientId: {
@@ -43,10 +38,10 @@ const configDecl = {
     env: "OFFICE365_CLIENT_ID",
   },
   signIn: {
-    options: ["device", "browser", "app", "smtp"],
+    options: ["device", "browser", "app"],
     label: "Sign-in method",
     description:
-      "device (default), browser, app or smtp. smtp skips Graph altogether and hands the mail to a relay, which is the way out of a tenant that consents to nothing — the email step and channel keep working, the calendar, file and Teams steps do not. app is the unattended one: ilmari signs in as the application itself with a client secret, once, with no browser and no per-workflow prompt — it needs application (not delegated) permissions consented by an administrator, and a mailbox to act as. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
+      "device (default), browser or app. app is the unattended one: ilmari signs in as the application itself with a client secret, once, with no browser and no per-workflow prompt — it needs application (not delegated) permissions consented by an administrator, and a mailbox to act as. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
     env: "OFFICE365_SIGN_IN",
   },
   clientSecret: {
@@ -82,36 +77,6 @@ const configDecl = {
     description:
       "The delegated permissions to ask for; none picked means all of them. Each one costs a surface when left out: Mail.Send the email step and channel, Calendars.Read the calendar step, Files.Read.All the file tools, Chat.ReadWrite and ChannelMessage.Send the Teams step. offline_access is what lets a sign-in survive a restart. Tenants that refuse user consent need an administrator to approve whatever is picked here.",
     env: "OFFICE365_SCOPES",
-  },
-  smtpHost: {
-    label: "SMTP server",
-    description:
-      "Only for the smtp sign-in: the relay that accepts the mail, e.g. smtp.office365.com or a company relay. Microsoft 365 has SMTP AUTH switched off by default, so smtp.office365.com works only once an administrator turns it on for the mailbox.",
-    env: "OFFICE365_SMTP_HOST",
-  },
-  smtpPort: {
-    label: "SMTP port",
-    description: "587 for STARTTLS (the default), 465 for implicit TLS, 25 for an internal relay.",
-    env: "OFFICE365_SMTP_PORT",
-  },
-  smtpUser: {
-    label: "SMTP username",
-    description:
-      "Usually the full email address. Leave empty for an internal relay that takes unauthenticated mail from your network.",
-    env: "OFFICE365_SMTP_USER",
-  },
-  smtpPassword: {
-    label: "SMTP password",
-    description:
-      "The password or app password for that user. Stored encrypted, and never sent over a connection the relay has not encrypted first.",
-    secret: true,
-    env: "OFFICE365_SMTP_PASSWORD",
-  },
-  smtpFrom: {
-    label: "From address",
-    description:
-      "The sender the relay puts on every message. Most relays insist it match the authenticated user; empty falls back to the username.",
-    env: "OFFICE365_SMTP_FROM",
   },
   tenantId: {
     label: "Directory (tenant) ID",
@@ -442,47 +407,9 @@ async function readAttachments(workdir, paths) {
   return { attachments, skipped };
 }
 
-/** Hands the same mail to a relay instead of to Graph. The attachments are
- *  already Graph fileAttachments by the time they get here, so their bytes
- *  come back out of the base64 the Graph shape carries them in. */
-async function relayMail(cfg, { to, cc, subject, body, html, attachments }) {
-  const host = text(cfg.smtpHost).trim();
-  if (!host) throw new Error("the smtp sign-in needs an SMTP server");
-  const user = text(cfg.smtpUser).trim();
-  const from = text(cfg.smtpFrom).trim() || user;
-  if (!from) throw new Error("the smtp sign-in needs a from address");
-  const toList = list(to);
-  const ccList = list(cc);
-  const message = buildMessage({
-    from,
-    to: toList,
-    cc: ccList,
-    subject: subject || "(no subject)",
-    body,
-    html,
-    attachments: attachments.map((a) => ({
-      name: a.name,
-      content: Buffer.from(a.contentBytes, "base64"),
-    })),
-  });
-  return await smtpSend({
-    host,
-    port: Number(text(cfg.smtpPort).trim() || 587),
-    user,
-    password: text(cfg.smtpPassword),
-    from,
-    recipients: [...toList, ...ccList],
-    message,
-  });
-}
-
 /** The one place a mail is built and posted, shared by the node type, the
  *  agent tool and the notification channel. */
 async function sendMail(ctx, { to, cc, subject, body, html, attachments = [] }, opts) {
-  const cfg = ctx.pluginConfig(PLUGIN, opts?.project) ?? {};
-  if (text(cfg.signIn).trim() === "smtp") {
-    return await relayMail(cfg, { to, cc, subject, body, html, attachments });
-  }
   const toRecipients = recipients(to);
   if (toRecipients.length === 0) throw new Error("no recipient");
   await graph(
@@ -592,231 +519,6 @@ async function postTeamsMessage(ctx, { chat, team, channel, message, html }, opt
   throw new Error("name either a chat id, or both a team id and a channel id");
 }
 
-// The SMTP client below is lifted from ilmari-plugin-smtp (Apache-2.0, same
-// author): one file per plugin is the hash-pin rule, so it is copied rather
-// than imported. Keep the two in sync when either is fixed.
-// ------------------------------------------------------------ smtp client
-
-/** One SMTP conversation over an already-open socket: read replies, write
- *  commands, and upgrade the socket in place when STARTTLS is used. */
-function dialogue(socket) {
-  let buffer = "";
-  let waiter = null;
-
-  const onData = (chunk) => {
-    buffer += chunk.toString("utf8");
-    deliver();
-  };
-  /** A reply ends at the line whose fourth character is a space ("250 ok"),
-   *  not at the first newline — "250-SIZE" lines are continuations. */
-  const deliver = () => {
-    if (!waiter) return;
-    const lines = buffer.split("\r\n");
-    const end = lines.findIndex((l) => /^\d{3} /.test(l));
-    if (end === -1) return;
-    const reply = lines.slice(0, end + 1).join("\n");
-    buffer = lines.slice(end + 1).join("\r\n");
-    const { resolve: done } = waiter;
-    waiter = null;
-    done({ code: Number(reply.slice(0, 3)), text: reply });
-  };
-
-  let current = socket;
-  current.on("data", onData);
-
-  return {
-    get socket() {
-      return current;
-    },
-    /** Hands the data listener to the TLS socket STARTTLS produced. */
-    upgrade(next) {
-      current.removeListener("data", onData);
-      buffer = "";
-      current = next;
-      current.on("data", onData);
-    },
-    read() {
-      return new Promise((res, rej) => {
-        waiter = { resolve: res };
-        deliver();
-        const timer = setTimeout(() => rej(new Error("SMTP timed out waiting for a reply")), TIMEOUT_MS);
-        const clear = () => clearTimeout(timer);
-        const wrapped = waiter;
-        if (wrapped) {
-          const original = wrapped.resolve;
-          wrapped.resolve = (value) => {
-            clear();
-            original(value);
-          };
-        }
-      });
-    },
-    write(line) {
-      current.write(`${line}\r\n`);
-    },
-    end() {
-      current.end();
-    },
-  };
-}
-
-async function expect(chat, codes, what) {
-  const reply = await chat.read();
-  if (!codes.includes(reply.code)) throw new Error(`${what}: ${reply.text.trim()}`);
-  return reply;
-}
-
-async function command(chat, line, codes, what) {
-  chat.write(line);
-  return await expect(chat, codes, what);
-}
-
-function openSocket({ host, port, implicitTls, rejectUnauthorized }) {
-  return new Promise((res, rej) => {
-    const socket = implicitTls
-      ? tlsConnect({ host, port, servername: host, rejectUnauthorized }, () => res(socket))
-      : netConnect({ host, port }, () => res(socket));
-    socket.setTimeout(TIMEOUT_MS);
-    socket.once("error", rej);
-    socket.once("timeout", () => {
-      socket.destroy();
-      rej(new Error(`SMTP connection to ${host}:${port} timed out`));
-    });
-  });
-}
-
-/**
- * Delivers one already-built message. Returns the accepted recipients.
- *
- * `requireTls` is what keeps a password off the wire in the clear: unless the
- * connection is already TLS, the server must offer STARTTLS before AUTH.
- */
-export async function smtpSend(options) {
-  const {
-    host,
-    port,
-    user,
-    password,
-    from,
-    recipients,
-    message,
-    rejectUnauthorized = true,
-    requireTls = true,
-  } = options;
-  const implicitTls = Number(port) === 465;
-  const socket = await openSocket({ host, port: Number(port), implicitTls, rejectUnauthorized });
-  let chat = dialogue(socket);
-  let secure = implicitTls;
-  try {
-    await expect(chat, [220], `SMTP ${host} greeting`);
-    let greeting = await command(chat, `EHLO ${clientName(from)}`, [250], "EHLO");
-
-    if (!secure && /STARTTLS/i.test(greeting.text)) {
-      await command(chat, "STARTTLS", [220], "STARTTLS");
-      const upgraded = await new Promise((res, rej) => {
-        const t = tlsConnect({ socket, servername: host, rejectUnauthorized }, () => res(t));
-        t.once("error", rej);
-      });
-      chat.upgrade(upgraded);
-      secure = true;
-      // the capability list is renegotiated over the encrypted channel
-      greeting = await command(chat, `EHLO ${clientName(from)}`, [250], "EHLO after STARTTLS");
-    }
-
-    if (user) {
-      if (!secure && requireTls) {
-        throw new Error(
-          `${host}:${port} offered no STARTTLS — refusing to send the password over an unencrypted connection`,
-        );
-      }
-      await authenticate(chat, greeting.text, user, password ?? "");
-    }
-
-    await command(chat, `MAIL FROM:<${from}>`, [250], "MAIL FROM");
-    const accepted = [];
-    for (const rcpt of recipients) {
-      const reply = await command(chat, `RCPT TO:<${rcpt}>`, [250, 251], `RCPT TO <${rcpt}>`);
-      if (reply.code === 250 || reply.code === 251) accepted.push(rcpt);
-    }
-    await command(chat, "DATA", [354], "DATA");
-    chat.write(`${dotStuff(message)}\r\n.`);
-    await expect(chat, [250], "message body");
-    chat.write("QUIT");
-    return accepted;
-  } finally {
-    chat.end();
-  }
-}
-
-/** AUTH PLAIN when offered (one round trip), else AUTH LOGIN, which is what
- *  older Exchange and many internal relays speak. */
-async function authenticate(chat, capabilities, user, password) {
-  const b64 = (s) => Buffer.from(s, "utf8").toString("base64");
-  if (/AUTH[ =-][^\n]*PLAIN/i.test(capabilities)) {
-    await command(chat, `AUTH PLAIN ${b64(`\0${user}\0${password}`)}`, [235], "AUTH PLAIN");
-    return;
-  }
-  await command(chat, "AUTH LOGIN", [334], "AUTH LOGIN");
-  await command(chat, b64(user), [334], "AUTH LOGIN username");
-  await command(chat, b64(password), [235], "AUTH LOGIN password");
-}
-
-/** A bare "." on its own line ends the DATA block, so any line that already
- *  starts with one has to be doubled. */
-const dotStuff = (body) => body.replace(/\r\n\./g, "\r\n..");
-
-const clientName = (from) => from.split("@")[1] || "localhost";
-
-/** RFC 2047, so a Czech subject does not arrive as mojibake. */
-const encodeHeader = (value) =>
-  /^[\x20-\x7e]*$/.test(value)
-    ? value
-    : `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
-
-const base64Lines = (buf) => (buf.toString("base64").match(/.{1,76}/g) ?? []).join("\r\n");
-
-/** Builds the RFC 5322 message: plain single part, or multipart/mixed when
- *  there are attachments. Everything is base64 so no relay has to be trusted
- *  with 8-bit or long lines. */
-export function buildMessage({ from, to, cc, subject, body, html, attachments = [], date }) {
-  const boundary = `ilmari-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
-  const headers = [
-    `From: ${from}`,
-    `To: ${to.join(", ")}`,
-    ...(cc.length > 0 ? [`Cc: ${cc.join(", ")}`] : []),
-    `Subject: ${encodeHeader(subject)}`,
-    `Date: ${(date ?? new Date()).toUTCString()}`,
-    `Message-ID: <${boundary}@${clientName(from)}>`,
-    "MIME-Version: 1.0",
-  ];
-  const bodyPart = [
-    `Content-Type: text/${html ? "html" : "plain"}; charset=UTF-8`,
-    "Content-Transfer-Encoding: base64",
-    "",
-    base64Lines(Buffer.from(body, "utf8")),
-  ];
-
-  if (attachments.length === 0) {
-    return [...headers, ...bodyPart].join("\r\n");
-  }
-  const parts = [
-    `--${boundary}`,
-    ...bodyPart,
-    ...attachments.flatMap((a) => [
-      `--${boundary}`,
-      `Content-Type: application/octet-stream; name="${encodeHeader(a.name)}"`,
-      "Content-Transfer-Encoding: base64",
-      `Content-Disposition: attachment; filename="${encodeHeader(a.name)}"`,
-      "",
-      base64Lines(a.content),
-    ]),
-    `--${boundary}--`,
-  ];
-  return [...headers, `Content-Type: multipart/mixed; boundary="${boundary}"`, "", ...parts].join(
-    "\r\n",
-  );
-}
-
 // ---------------------------------------------------------------- plugin
 
 const plugin = {
@@ -837,10 +539,7 @@ const plugin = {
       async send(message, ctx) {
         if (!ctx?.pluginConfig) return; // no way to reach the config: stay silent
         const cfg = ctx.pluginConfig("office365") ?? {};
-        // the smtp sign-in reaches no Graph app at all, so it is the relay
-        // that has to be configured, not a client id
-        const configured = text(cfg.signIn).trim() === "smtp" ? cfg.smtpHost : cfg.clientId;
-        if (!configured || !cfg.to) return; // unconfigured — stay silent
+        if (!cfg.clientId || !cfg.to) return; // unconfigured — stay silent
         // interactive: false — a notification must never block on a sign-in
         // the user has to finish in a browser
         await sendMail(
