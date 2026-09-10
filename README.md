@@ -152,6 +152,24 @@ The **Permissions** field is ignored in this mode: application permissions are
 whatever the registration was consented for, and the token is asked for with
 `.default`.
 
+#### When the tenant consents to nothing
+
+Both Graph routes end at the same wall: somebody with administrator rights has
+to approve something. **Sign-in method** `smtp` walks around it — the mail goes
+to a relay instead of to Graph, so no consent, no token and no sign-in are
+involved at all.
+
+Fill in **SMTP server**, **SMTP port** (587 STARTTLS, 465 implicit TLS, 25 for
+an internal relay), the **username**/**password** if the relay wants them, and
+the **From address**. A password is never sent over a connection the relay has
+not encrypted first: no STARTTLS, no send.
+
+Only the email step, the email tool and the notification channel work this way
+— the calendar, file and Teams steps are Graph, and stay unavailable. And note
+that Exchange Online has SMTP AUTH switched off by default, so
+`smtp.office365.com` needs an administrator too; an internal company relay
+usually does not, which is the point of this route.
+
 ## Using it
 
 Report a task's result by mail:
