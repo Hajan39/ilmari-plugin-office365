@@ -363,3 +363,13 @@ test("the file tools search and read as the signed-in user", async () => {
   });
   assert.equal(await toolOf("office365_read_file").execute({ id: "01ABC" }, ctx), "# spec");
 });
+
+test("configured permissions replace the full scope set", async () => {
+  const seen = stubFetch([
+    ["/oauth2/v2.0/token", TOKEN_OK],
+    ["/me/sendMail", { status: 202 }],
+  ]);
+  const ctx = ctxFor({ config: { scopes: "offline_access Mail.Send" } });
+  await nodeOf("office365-email").run({ to: "a@corp.com", subject: "s", body: "b" }, ctx);
+  assert.equal(new URLSearchParams(seen[0].body).get("scope"), "offline_access Mail.Send");
+});
