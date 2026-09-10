@@ -7,9 +7,15 @@
 // signed-in user* is the point — mail leaves from their own mailbox and lands
 // in their Sent Items — and a public client needs no client secret to store.
 
+import { createHash, randomBytes } from "node:crypto";
+
 const PLUGIN = "office365";
 const GRAPH = "https://graph.microsoft.com/v1.0";
 const DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code";
+/** Where the browser sign-in lands. Nothing listens there: the user copies the
+ *  code out of the address bar. Must be registered on the app as a "Mobile and
+ *  desktop" redirect (Microsoft's own public clients already have it). */
+const BROWSER_REDIRECT = "http://localhost";
 
 /** offline_access is what makes a sign-in survive a daemon restart; the rest
  *  are the delegated permissions this plugin's surfaces need. The user is
@@ -30,6 +36,18 @@ const configDecl = {
     description:
       "The app registration ilmari signs in through: Azure Portal -> Microsoft Entra ID -> App registrations -> your app -> Overview. It must be a public client with device code flow allowed. No client secret is needed.",
     env: "OFFICE365_CLIENT_ID",
+  },
+  signIn: {
+    label: "Sign-in method",
+    description:
+      "device (default) or browser. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
+    env: "OFFICE365_SIGN_IN",
+  },
+  authCode: {
+    label: "Authorization code",
+    description:
+      "Only for the browser sign-in: paste the code (or the whole http://localhost?code=... address) here while a step waits for it. Single-use; cleared automatically once exchanged.",
+    secret: true,
   },
   tenantId: {
     label: "Directory (tenant) ID",
@@ -119,6 +137,59 @@ export async function deviceCodeSignIn(clientId, tenantId, announce, sleep = wai
 }
 
 /**
+ * Authorization code + PKCE, with the sign-in done in the user's own browser
+ * and the code carried back by hand — for tenants whose Conditional Access
+ * refuses device code (the token request comes from the daemon, not from a
+ * compliant device). `readCode` is polled until it yields the pasted code.
+ */
+export async function browserSignIn(clientId, tenantId, announce, readCode, sleep = wait) {
+  const base = authBase(tenantId);
+  const verifier = randomBytes(32).toString("base64url");
+  const challenge = createHash("sha256").update(verifier).digest("base64url");
+  const url = `${base}/authorize?${new URLSearchParams({
+    client_id: clientId,
+    response_type: "code",
+    redirect_uri: BROWSER_REDIRECT,
+    scope: SCOPE,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    prompt: "select_account",
+  })}`;
+  announce(
+    `Sign in to Microsoft at ${url}
+` +
+      `The browser ends on an unreachable ${BROWSER_REDIRECT} page: paste its address (or the code=... part) into the office365 plugin's "Authorization code" field.`,
+  );
+  // a code left over from an earlier attempt is bound to that attempt's
+  // verifier and would only fail the exchange — wait for a fresh paste
+  const stale = readCode();
+  const deadline = Date.now() + 900_000;
+  while (Date.now() < deadline) {
+    await sleep(3000);
+    const pasted = readCode();
+    if (!pasted || pasted === stale) continue;
+    const code = pasted.includes("code=") ? new URL(pasted).searchParams.get("code") : pasted;
+    const token = await postForm(`${base}/token`, {
+      grant_type: "authorization_code",
+      client_id: clientId,
+      code,
+      redirect_uri: BROWSER_REDIRECT,
+      code_verifier: verifier,
+      scope: SCOPE,
+    });
+    if (token.access_token && token.refresh_token) {
+      return {
+        accessToken: token.access_token,
+        refreshToken: token.refresh_token,
+        expiresIn: token.expires_in ?? 3600,
+      };
+    }
+    throw new Error(`sign-in failed: ${token.error_description ?? token.error}`);
+  }
+  throw new Error("sign-in timed out — no authorization code was pasted within 15 minutes");
+}
+
+/**
  * A usable access token: the cached one, else a refresh, else a full sign-in
  * announced through `announce`. `interactive: false` — the email channel,
  * which must not hang a notification for fifteen minutes — turns a missing or
@@ -162,6 +233,12 @@ export async function graphToken(ctx, { project, announce, interactive = true } 
     say(`Microsoft sign-in expired (${refreshed.error ?? "unknown"})`);
   }
   if (!interactive) return null;
+  if ((cfg.signIn ?? "").trim() === "browser") {
+    const readCode = () => (ctx.pluginConfig(PLUGIN, project)?.authCode ?? "").trim();
+    const tokens = await browserSignIn(clientId, tenantId, say, readCode);
+    ctx.savePluginConfig?.(PLUGIN, { authCode: "" }, project); // single-use
+    return remember(tokens);
+  }
   return remember(await deviceCodeSignIn(clientId, tenantId, say));
 }
 
@@ -380,7 +457,7 @@ async function postTeamsMessage(ctx, { chat, team, channel, message, html }, opt
 
 const plugin = {
   name: "office365",
-  version: "0.1.0",
+  version: "0.1.1",
   description:
     "Microsoft 365 for ilmari, as the signed-in user: send mail from your own mailbox (with attachments from the working directory), read your calendar, search and read OneDrive/SharePoint files, and post into a Teams chat or channel. Sign-in is the device-code flow — you approve it once in a browser and ilmari keeps a refresh token in its encrypted config.",
   setup:

@@ -86,6 +86,8 @@ In the GUI's **Plugins** screen, on **office365**:
 | Application (client) ID | from the app registration's Overview |
 | Directory (tenant) ID | from the same page; empty means "any work account" |
 | Default recipient | where the `email` channel sends notifications |
+| Sign-in method | `device` (default) or `browser`, see below |
+| Authorization code | only for `browser`: pasted while a step waits for it |
 | Sign-in token | leave empty — it fills itself in |
 
 Every field has an environment fallback (`OFFICE365_CLIENT_ID`,
@@ -103,6 +105,24 @@ Sign in to Microsoft at https://microsoft.com/devicelogin and enter the code F7X
 
 Open it, sign in, and the step continues on its own. From then on the refresh
 token is used silently; clear the **Sign-in token** field to sign out.
+
+#### When Conditional Access blocks device code
+
+Some tenants answer the device-code sign-in with *"You cannot access this right
+now"*: the token request comes from the daemon, which is not a compliant
+device. Set **Sign-in method** to `browser`. The step then logs a sign-in link
+(authorization code + PKCE) to open in your own managed browser; after
+signing in, the browser lands on an unreachable `http://localhost/?code=...`
+page. Paste that address (or just the code) into **Authorization code** while
+the step is still waiting — it polls for up to 15 minutes, exchanges the code
+once and clears the field.
+
+Prerequisite: `http://localhost` registered on the app as a *Mobile and
+desktop applications* redirect URI. When you cannot register an app at all,
+Microsoft's own public clients already have it — e.g. Microsoft Graph Command
+Line Tools, client ID `14d82eec-204b-4c2f-b7e8-296a70dab67e` — and the
+delegated scopes are then consented per user, if the tenant allows user
+consent.
 
 ## Using it
 

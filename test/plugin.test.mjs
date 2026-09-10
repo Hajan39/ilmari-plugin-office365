@@ -2,11 +2,12 @@
 // its config through ctx.pluginConfig and writes the rotated refresh token
 // through ctx.savePluginConfig, so a fake ctx is all the wiring needed.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, test } from "node:test";
-import plugin, { dayRange, deviceCodeSignIn, forgetTokens } from "../dist/index.js";
+import plugin, { browserSignIn, dayRange, deviceCodeSignIn, forgetTokens } from "../dist/index.js";
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -292,6 +293,29 @@ test("device code sign-in waits through authorization_pending and slow_down", as
   assert.equal(out.refreshToken, "rt-2");
   assert.equal(call, 3);
   assert.match(said[0], /ABCD/);
+});
+
+test("browser sign-in announces a PKCE link, waits for a fresh paste and exchanges it", async () => {
+  const seen = stubFetch([["/oauth2/v2.0/token", TOKEN_OK]]);
+  const said = [];
+  let pasted = "old-code"; // left over from an earlier attempt: must be ignored
+  let polls = 0;
+  const readCode = () => {
+    if (++polls === 3) pasted = "http://localhost/?code=fresh-code&session_state=x";
+    return pasted;
+  };
+  const out = await browserSignIn("app-1", "tenant-1", (m) => said.push(m), readCode, async () => {});
+  assert.equal(out.refreshToken, "rt-2");
+  const link = new URL(said[0].match(/https:\S+/)[0]);
+  assert.equal(link.searchParams.get("code_challenge_method"), "S256");
+  assert.equal(link.searchParams.get("redirect_uri"), "http://localhost");
+  const body = new URLSearchParams(seen.at(-1).body);
+  assert.equal(seen.length, 1);
+  assert.equal(body.get("grant_type"), "authorization_code");
+  assert.equal(body.get("code"), "fresh-code");
+  assert.equal(body.get("redirect_uri"), "http://localhost");
+  const challenge = createHash("sha256").update(body.get("code_verifier")).digest("base64url");
+  assert.equal(challenge, link.searchParams.get("code_challenge"));
 });
 
 test("device code sign-in surfaces a fatal error instead of looping", async () => {
