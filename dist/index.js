@@ -38,6 +38,7 @@ const configDecl = {
     env: "OFFICE365_CLIENT_ID",
   },
   signIn: {
+    options: ["device", "browser"],
     label: "Sign-in method",
     description:
       "device (default) or browser. Use browser when Conditional Access blocks the device-code flow: the task log shows a sign-in link to open in your own (managed) browser; it ends on an unreachable http://localhost page — paste that page's address, or just its code=..., into 'Authorization code' while the step is waiting.",
@@ -51,8 +52,17 @@ const configDecl = {
   },
   scopes: {
     label: "Permissions",
+    options: [
+      "offline_access",
+      "Mail.Send",
+      "Calendars.Read",
+      "Files.Read.All",
+      "Chat.ReadWrite",
+      "ChannelMessage.Send",
+    ],
+    multiple: true,
     description:
-      "Space-separated delegated scopes to ask for. Empty means all the plugin's surfaces. Files.Read.All, Chat.ReadWrite and ChannelMessage.Send need an administrator's consent — drop them here (leaving e.g. 'offline_access Mail.Send Calendars.Read') to sign in with user consent alone, at the cost of the file, chat and channel steps.",
+      "The delegated permissions to ask for; none picked means all of them. Each one costs a surface when left out: Mail.Send the email step and channel, Calendars.Read the calendar step, Files.Read.All the file tools, Chat.ReadWrite and ChannelMessage.Send the Teams step. offline_access is what lets a sign-in survive a restart. Tenants that refuse user consent need an administrator to approve whatever is picked here.",
     env: "OFFICE365_SCOPES",
   },
   tenantId: {
